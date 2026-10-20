@@ -1,0 +1,54 @@
+import type { Guild, Message, User } from "../internal/discord.js";
+import { resolveTimestampMs } from "./format.js";
+import {
+  resolveDiscordReferencedReplyMessage,
+  resolveDiscordReferencedReplyMessageId,
+} from "./message-forwarded.js";
+import { resolveDiscordSenderIdentity } from "./sender-identity.js";
+
+export function resolveReplyContext(
+  message: Message,
+  resolveDiscordMessageText: (message: Message, options?: { includeForwarded?: boolean }) => string,
+) {
+  const id = resolveDiscordReferencedReplyMessageId(message);
+  if (!id) {
+    return null;
+  }
+  const referenced = resolveDiscordReferencedReplyMessage(message);
+  const channelId = message.messageReference?.channel_id ?? message.channelId;
+  if (!referenced?.author || referenced.id !== id) {
+    return null;
+  }
+  const referencedText = resolveDiscordMessageText(referenced, {
+    includeForwarded: true,
+  });
+  const sender = resolveDiscordSenderIdentity({
+    author: referenced.author,
+    pluralkitInfo: null,
+  });
+  return {
+    id,
+    channelId,
+    sender: sender.tag ?? sender.label ?? "unknown",
+    senderId: referenced.author.id,
+    senderName: referenced.author.username,
+    senderTag: sender.tag,
+    memberRoleIds: referenced.member?.roles,
+    ...(referencedText ? { body: referencedText } : {}),
+    timestamp: resolveTimestampMs(referenced.timestamp),
+  };
+}
+
+export function buildDirectLabel(author: User) {
+  const username = resolveDiscordSenderIdentity({ author, pluralkitInfo: null }).tag;
+  return `${username ?? "unknown"} user id:${author.id}`;
+}
+
+export function buildGuildLabel(params: {
+  guild?: Guild<true> | Guild;
+  channelName: string;
+  channelId: string;
+}) {
+  const { guild, channelName, channelId } = params;
+  return `${guild?.name ?? "Guild"} #${channelName} channel id:${channelId}`;
+}
