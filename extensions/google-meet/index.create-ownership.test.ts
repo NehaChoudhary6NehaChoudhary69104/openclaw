@@ -6,6 +6,8 @@ import plugin from "./index.js";
 import { MEET_URL, MEET_URL_EN } from "./src/test-support/fixtures.test-helpers.js";
 import {
   createGoogleMeetToolGatewayForTest,
+  getMeetTool,
+  invokeGoogleMeetGatewayMethodForTest,
   setupGoogleMeetPlugin,
 } from "./src/test-support/plugin-harness.js";
 
@@ -28,19 +30,42 @@ vi.mock("./src/runtime.js", async (importOriginal) => {
 
 const requireRecord = createRequireRecord("record", "expected-label-object-capitalized");
 
+function browserTab(targetId: string, url = MEET_URL_EN) {
+  return { targetId, title: "Meet", url };
+}
+
+function browserProxyPayload(result: unknown) {
+  return { payload: { result } };
+}
+
 describe("registered Google Meet create tab ownership", () => {
   meetingTestState = useMeetingTestState(createOpenClawTestState);
   afterEach(() => vi.restoreAllMocks());
 
-  it.each([
-    { owner: "plugin", preexisting: false },
-    { owner: "user", preexisting: true },
-  ])("preserves $owner tab ownership through create and leave", async ({ preexisting }) => {
+  it("rejects invalid join choices before launching a browser or creating a space", async () => {
+    const harness = setupGoogleMeetPlugin(plugin, { defaultTransport: "chrome-node" });
+    vi.spyOn(gatewayRuntime, "callGatewayFromCli").mockImplementation(
+      createGoogleMeetToolGatewayForTest(harness.methods),
+    );
+    const result = await getMeetTool(harness).execute("join", {
+      action: "join",
+      url: MEET_URL,
+      mode: "transribe",
+    });
+    expect(result.details.error).toContain("mode must be");
+    await expect(
+      invokeGoogleMeetGatewayMethodForTest(harness.methods, "googlemeet.create", {
+        transport: "chorme",
+      }),
+    ).rejects.toThrow("transport must be");
+    expect(harness.nodesInvoke).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("preserves create tab ownership (preexisting=%s)", async (preexisting) => {
     const targetId = "created-meet-tab";
-    const tabs = new Map<string, { targetId: string; title: string; url: string }>();
-    if (preexisting) {
-      tabs.set(targetId, { targetId, title: "Meet", url: MEET_URL_EN });
-    }
+    const tabs = new Map<string, ReturnType<typeof browserTab>>(
+      preexisting ? [[targetId, browserTab(targetId)]] : [],
+    );
     const opened: string[] = [];
     const closed: string[] = [];
     const harness = setupGoogleMeetPlugin(
@@ -56,7 +81,7 @@ describe("registered Google Meet create tab ownership", () => {
             throw new Error(`Unexpected node command: ${command}`);
           }
           const request = requireRecord(params, "browser request");
-          const reply = (result: unknown) => ({ payload: { result } });
+          const reply = browserProxyPayload;
           if (request.path === "/tabs") {
             return reply({ running: true, tabs: [...tabs.values()] });
           }
@@ -64,7 +89,7 @@ describe("registered Google Meet create tab ownership", () => {
             const body = requireRecord(request.body, "open request");
             expect(body.url).toBe("https://meet.google.com/new?hl=en");
             opened.push(targetId);
-            const tab = { targetId, title: "Meet", url: String(body.url) };
+            const tab = browserTab(targetId, String(body.url));
             tabs.set(targetId, tab);
             return reply(tab);
           }
@@ -79,29 +104,27 @@ describe("registered Google Meet create tab ownership", () => {
           if (request.path === "/act") {
             const body = requireRecord(request.body, "evaluate request");
             expect(body.targetId).toBe(targetId);
-            if (typeof body.fn === "string" && body.fn.includes("meetUrlPattern")) {
-              tabs.set(targetId, { targetId, title: "Meet", url: MEET_URL_EN });
-              return reply({
-                ok: true,
-                targetId,
-                result: { meetingUri: MEET_URL, browserUrl: MEET_URL_EN, browserTitle: "Meet" },
-              });
+            const creating = typeof body.fn === "string" && body.fn.includes("meetUrlPattern");
+            if (creating) {
+              tabs.set(targetId, browserTab(targetId));
             }
             return reply({
               ok: true,
               targetId,
-              result: JSON.stringify({
-                inCall: true,
-                micMuted: true,
-                url: MEET_URL_EN,
-                title: "Meet",
-                lines: [],
-                pendingLines: [],
-                droppedLines: 0,
-                urlMatched: true,
-                sessionMatched: true,
-                departed: true,
-              }),
+              result: creating
+                ? { meetingUri: MEET_URL, browserUrl: MEET_URL_EN, browserTitle: "Meet" }
+                : JSON.stringify({
+                    inCall: true,
+                    micMuted: true,
+                    url: MEET_URL_EN,
+                    title: "Meet",
+                    lines: [],
+                    pendingLines: [],
+                    droppedLines: 0,
+                    urlMatched: true,
+                    sessionMatched: true,
+                    departed: true,
+                  }),
             });
           }
           throw new Error(`Unexpected browser request: ${String(request.path)}`);
@@ -111,7 +134,8 @@ describe("registered Google Meet create tab ownership", () => {
     vi.spyOn(gatewayRuntime, "callGatewayFromCli").mockImplementation(
       createGoogleMeetToolGatewayForTest(harness.methods),
     );
-    const tool = harness.tools[0];
+    const { tools, nodesInvoke } = harness;
+    const tool = tools[0];
     if (!tool) {
       throw new Error("Expected Google Meet tool");
     }
@@ -119,15 +143,24 @@ describe("registered Google Meet create tab ownership", () => {
       (await tool.execute("create", { action: "create" })).details,
       "created meeting",
     );
-    expect(created.joined).toBe(true);
-    expect(created.meetingUri).toBe(MEET_URL);
-    const join = requireRecord(created.join, "join result");
-    const session = requireRecord(join.session, "meeting session");
-    const left = requireRecord(
-      (await tool.execute("leave", { action: "leave", sessionId: session.id })).details,
-      "leave result",
+    expect(created).toMatchObject({
+      source: "browser",
+      joined: true,
+      meetingUri: MEET_URL,
+      join: { session: { url: MEET_URL } },
+    });
+    expect(nodesInvoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "googlemeet.chrome",
+        params: expect.objectContaining({ action: "start", url: MEET_URL, launch: false }),
+      }),
     );
-    expect(left.error).toBeUndefined();
+    const session = requireRecord(
+      requireRecord(created.join, "join result").session,
+      "meeting session",
+    );
+    const left = (await tool.execute("leave", { action: "leave", sessionId: session.id })).details;
+    expect(requireRecord(left, "leave result").error).toBeUndefined();
     expect(opened).toEqual(preexisting ? [] : [targetId]);
     expect(closed).toEqual(preexisting ? [] : [targetId]);
     expect(tabs.has(targetId)).toBe(preexisting);
